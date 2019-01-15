@@ -750,12 +750,27 @@ func (p *blockBodyDiffPrinter) writeValueDiff(old, new cty.Value, indent int, pa
 			}
 			p.buf.WriteString("\n")
 
-			elemDiffs := ctySequenceDiff(old.AsValueSlice(), new.AsValueSlice())
-			for _, elemDiff := range elemDiffs {
-				p.buf.WriteString(strings.Repeat(" ", indent+2))
-				p.writeActionSymbol(elemDiff.Action)
-				p.writeValue(elemDiff.Value, elemDiff.Action, indent+4)
-				p.buf.WriteString(",\n")
+			if ty.IsListType() && ty.ElementType().IsObjectType() {
+				elemDiffs := ctyObjectSequenceDiff(old.AsValueSlice(), new.AsValueSlice(), 1)
+				for _, elemDiff := range elemDiffs {
+					p.buf.WriteString(strings.Repeat(" ", indent+2))
+					if elemDiff.Action == plans.NoOp {
+						p.writeValue(elemDiff.Before, elemDiff.Action, indent+4)
+					} else {
+						p.writeActionSymbol(elemDiff.Action)
+						p.writeValueDiff(elemDiff.Before, elemDiff.After, indent+4, path)
+					}
+
+					p.buf.WriteString(",\n")
+				}
+			} else {
+				elemDiffs := ctySequenceDiff(old.AsValueSlice(), new.AsValueSlice())
+				for _, elemDiff := range elemDiffs {
+					p.buf.WriteString(strings.Repeat(" ", indent+2))
+					p.writeActionSymbol(elemDiff.Action)
+					p.writeValue(elemDiff.Value, elemDiff.Action, indent+4)
+					p.buf.WriteString(",\n")
+				}
 			}
 
 			p.buf.WriteString(strings.Repeat(" ", indent))
@@ -835,6 +850,84 @@ func (p *blockBodyDiffPrinter) writeValueDiff(old, new cty.Value, indent int, pa
 
 			p.buf.WriteString(strings.Repeat(" ", indent))
 			p.buf.WriteString("}")
+			return
+		case ty.IsObjectType():
+			p.buf.WriteString("{")
+			p.buf.WriteString("\n")
+
+			forcesNewResource := p.pathForcesNewResource(path)
+
+			var allKeys []string
+			keyLen := 0
+			for it := old.ElementIterator(); it.Next(); {
+				k, _ := it.Element()
+				keyStr := k.AsString()
+				allKeys = append(allKeys, keyStr)
+				if len(keyStr) > keyLen {
+					keyLen = len(keyStr)
+				}
+			}
+			for it := new.ElementIterator(); it.Next(); {
+				k, _ := it.Element()
+				keyStr := k.AsString()
+				allKeys = append(allKeys, keyStr)
+				if len(keyStr) > keyLen {
+					keyLen = len(keyStr)
+				}
+			}
+
+			sort.Strings(allKeys)
+
+			lastK := ""
+			for i, k := range allKeys {
+				if i > 0 && lastK == k {
+					continue // skip duplicates (list is sorted)
+				}
+				lastK = k
+
+				p.buf.WriteString(strings.Repeat(" ", indent+2))
+				kV := k
+				var action plans.Action
+				if !old.Type().HasAttribute(kV) {
+					action = plans.Create
+				} else if !new.Type().HasAttribute(kV) {
+					action = plans.Delete
+				} else if eqV := old.GetAttr(kV).Equals(new.GetAttr(kV)); eqV.IsKnown() && eqV.True() {
+					action = plans.NoOp
+				} else {
+					action = plans.Update
+				}
+
+				path := append(path, cty.GetAttrStep{Name: kV})
+
+				p.writeActionSymbol(action)
+				p.writeValue(cty.StringVal(kV), action, indent+4)
+				p.buf.WriteString(":")
+				p.buf.WriteString(strings.Repeat(" ", keyLen-len(k)))
+				p.buf.WriteString(" ")
+				switch action {
+				case plans.Create, plans.NoOp:
+					v := new.GetAttr(kV)
+					p.writeValue(v, action, indent+4)
+				case plans.Delete:
+					oldV := old.GetAttr(kV)
+					newV := cty.NullVal(oldV.Type())
+					p.writeValueDiff(oldV, newV, indent+4, path)
+				default:
+					oldV := old.GetAttr(kV)
+					newV := new.GetAttr(kV)
+					p.writeValueDiff(oldV, newV, indent+4, path)
+				}
+
+				p.buf.WriteString(",\n")
+			}
+
+			p.buf.WriteString(strings.Repeat(" ", indent))
+			p.buf.WriteString("},")
+
+			if forcesNewResource {
+				p.buf.WriteString(p.color.Color(forcesNewResourceCaption))
+			}
 			return
 		}
 	}
